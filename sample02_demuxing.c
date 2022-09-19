@@ -32,12 +32,12 @@ static int open_input(const char* filename)
 
   for(index = 0; index < input_ctx.fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* codec_ctx = input_ctx.fmt_ctx->streams[index]->codec;
-    if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && input_ctx.v_index < 0)
+    AVCodecParameters* avCodecParams = input_ctx.fmt_ctx->streams[index]->codecpar;
+    if(avCodecParams->codec_type == AVMEDIA_TYPE_VIDEO && input_ctx.v_index < 0)
     {
       input_ctx.v_index = index;
     }
-    else if(codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && input_ctx.a_index < 0)
+    else if(avCodecParams->codec_type == AVMEDIA_TYPE_AUDIO && input_ctx.a_index < 0)
     {
       input_ctx.a_index = index;
     }
@@ -64,7 +64,6 @@ int main(int argc, char* argv[])
 {
   int ret;
 
-  av_register_all();
   av_log_set_level(AV_LOG_DEBUG);
 
   if(argc < 2)
@@ -100,7 +99,7 @@ int main(int argc, char* argv[])
       printf("Audio packet\n");
     }
 
-    av_free_packet(&pkt);
+    av_packet_unref(&pkt);
   } // while
 
 main_end:

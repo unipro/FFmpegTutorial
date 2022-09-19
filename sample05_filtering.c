@@ -5,13 +5,14 @@
 #include <stdio.h>
 
 #include <libavfilter/avfilter.h>
-#include <libavfilter/avfiltergraph.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 
 typedef struct _FileContext
 {
   AVFormatContext* fmt_ctx;
+  AVCodecContext *v_codec_ctx;
+  AVCodecContext *a_codec_ctx;
   int v_index;
   int a_index;
 } FileContext;
@@ -31,17 +32,33 @@ static const int dst_height = 320;
 static const int64_t dst_ch_layout = AV_CH_LAYOUT_MONO;
 static const int dst_sample_rate = 32000;
 
-static int open_decoder(AVCodecContext* codec_ctx)
+static int open_decoder(AVCodecContext **codec_ctx, AVStream* stream)
 {
-  AVCodec* decoder = avcodec_find_decoder(codec_ctx->codec_id);
+  const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
   if(decoder == NULL)
   {
     return -1;
   }
 
-  if(avcodec_open2(codec_ctx, decoder, NULL) < 0)
+  *codec_ctx = avcodec_alloc_context3(decoder);
+  if (!*codec_ctx)
   {
     return -2;
+  }
+
+  if(avcodec_parameters_to_context(*codec_ctx, stream->codecpar) < 0)
+  {
+    return -3;
+  }
+
+  if((*codec_ctx)->codec_type == AVMEDIA_TYPE_VIDEO)
+  {
+    (*codec_ctx)->framerate = av_guess_frame_rate(inputFile.fmt_ctx, stream, NULL);
+  }
+
+  if(avcodec_open2(*codec_ctx, decoder, NULL) < 0)
+  {
+    return -4;
   }
 
   return 0;
@@ -51,6 +68,7 @@ static int open_input(const char* filename)
 {
   unsigned int index;
   inputFile.fmt_ctx = NULL;
+  inputFile.a_codec_ctx = inputFile.v_codec_ctx = NULL;
   inputFile.a_index = inputFile.v_index = -1;
 
   if(avformat_open_input(&inputFile.fmt_ctx, filename, NULL, NULL) < 0)
@@ -67,19 +85,19 @@ static int open_input(const char* filename)
 
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-    if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
+    AVStream* stream = inputFile.fmt_ctx->streams[index];
+    if(stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.v_codec_ctx, stream) < 0)
       {
         break;
       }
 
       inputFile.v_index = index;
     }
-    else if(codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
+    else if(stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.a_codec_ctx, stream) < 0)
       {
         break;
       }
@@ -100,7 +118,7 @@ static int open_input(const char* filename)
 static int init_video_filter()
 {
   AVStream* stream = inputFile.fmt_ctx->streams[inputFile.v_index];
-  AVCodecContext* codec_ctx = stream->codec;
+  AVCodecContext* codec_ctx = inputFile.v_codec_ctx;
   AVFilterContext* rescale_filter;
   AVFilterInOut *inputs, *outputs;
   char args[512];
@@ -196,15 +214,18 @@ static int init_video_filter()
 
   avfilter_inout_free(&inputs);
   avfilter_inout_free(&outputs);
+
+  return 0;
 }
 
 static int init_audio_filter()
 {
   AVStream* stream = inputFile.fmt_ctx->streams[inputFile.a_index];
-  AVCodecContext* codec_ctx = stream->codec;
+  AVCodecContext* codec_ctx = inputFile.a_codec_ctx;
   AVFilterInOut *inputs, *outputs;
   AVFilterContext* resample_filter;
   char args[512];
+  uint64_t channel_layout;
 
   afilter_ctx.filter_graph = NULL;
   afilter_ctx.src_ctx = NULL;
@@ -300,22 +321,24 @@ static int init_audio_filter()
 
   avfilter_inout_free(&inputs);
   avfilter_inout_free(&outputs);
+
+  return 0;
 }
 
 static void release()
 {
+  if(inputFile.v_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.v_codec_ctx);
+  }
+
+  if(inputFile.a_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.a_codec_ctx);
+  }
+
   if(inputFile.fmt_ctx != NULL)
   {
-    unsigned int index;
-    for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
-    {
-      AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-      if(index == inputFile.v_index || index == inputFile.a_index)
-      {
-        avcodec_close(codec_ctx);
-      }
-    }
-
     avformat_close_input(&inputFile.fmt_ctx);
   }
 
@@ -330,27 +353,28 @@ static void release()
   }
 }
 
-static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame** frame, int* got_frame)
+static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame)
 {
-  int (*decode_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
-  int decoded_size;
+  int ret;
 
-  decode_func = (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 : avcodec_decode_audio4;
-  decoded_size = decode_func(codec_ctx, *frame, got_frame, pkt);
-  if(*got_frame)
+  if(avcodec_send_packet(codec_ctx, pkt) < 0)
   {
-    (*frame)->pts = av_frame_get_best_effort_timestamp(*frame);
+    return -1;
   }
 
-  return decoded_size;
+  ret = avcodec_receive_frame(codec_ctx, frame);
+  if(ret < 0)
+  {
+    return ret;
+  }
+
+  return 0;
 }
 
 int main(int argc, char* argv[])
 {
   int ret;
 
-  av_register_all();
-  avfilter_register_all();
   av_log_set_level(AV_LOG_DEBUG);
 
   if(argc < 2)
@@ -388,7 +412,6 @@ int main(int argc, char* argv[])
   }
   
   AVPacket pkt;
-  int got_frame;
   int stream_index;
 
   while(1)
@@ -401,21 +424,19 @@ int main(int argc, char* argv[])
     }
 
     stream_index = pkt.stream_index;
+    AVCodecContext* codec_ctx;
 
-    if(stream_index != inputFile.v_index && stream_index != inputFile.a_index)
+    if(stream_index == inputFile.v_index)
     {
-      av_free_packet(&pkt);
-      continue;
+      codec_ctx = inputFile.v_codec_ctx;
+    }
+    else if(stream_index == inputFile.a_index)
+    {
+      codec_ctx = inputFile.a_codec_ctx;
     }
 
-    AVStream* stream = inputFile.fmt_ctx->streams[pkt.stream_index];
-    AVCodecContext* codec_ctx = stream->codec;
-    got_frame = 0;
-
-    av_packet_rescale_ts(&pkt, stream->time_base, codec_ctx->time_base);
-
-    ret = decode_packet(codec_ctx, &pkt, &decoded_frame, &got_frame);
-    if(ret >= 0 && got_frame)
+    ret = decode_packet(codec_ctx, &pkt, decoded_frame);
+    if(ret >= 0)
     {
       FilterContext* filter_ctx;
       
@@ -425,7 +446,7 @@ int main(int argc, char* argv[])
         printf("[before] Video : resolution : %dx%d\n"
           , decoded_frame->width, decoded_frame->height);
       }
-      else
+      else if(stream_index == inputFile.a_index)
       {
         filter_ctx = &afilter_ctx;
         printf("[before] Audio : sample_rate : %d / channels : %d\n"
@@ -452,7 +473,7 @@ int main(int argc, char* argv[])
           printf("[after] Video : resolution : %dx%d\n"
             , filtered_frame->width, filtered_frame->height);
         }
-        else
+        else if(stream_index == inputFile.a_index)
         {
           printf("[after] Audio : sample_rate : %d / channels : %d\n"
             , filtered_frame->sample_rate, filtered_frame->channels);
@@ -463,8 +484,18 @@ int main(int argc, char* argv[])
       av_frame_unref(decoded_frame);
     } // if
 
-    av_free_packet(&pkt);
+    av_packet_unref(&pkt);
   } // while
+
+  // flush the decoder
+  if(inputFile.v_codec_ctx != NULL)
+  {
+    decode_packet(inputFile.v_codec_ctx, NULL, decoded_frame);
+  }
+  if(inputFile.a_codec_ctx != NULL)
+  {
+    decode_packet(inputFile.a_codec_ctx, NULL, decoded_frame);
+  }
 
   av_frame_free(&decoded_frame);
   av_frame_free(&filtered_frame);

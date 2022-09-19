@@ -6,13 +6,14 @@
 #include <stdio.h>
 
 #include <libavfilter/avfilter.h>
-#include <libavfilter/avfiltergraph.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 
 typedef struct _FileContext
 {
   AVFormatContext* fmt_ctx;
+  AVCodecContext *v_codec_ctx;
+  AVCodecContext *a_codec_ctx;
   int v_index;
   int a_index;
 } FileContext;
@@ -34,17 +35,33 @@ static const int dst_abit_rate = 128000;
 static const int64_t dst_ch_layout = AV_CH_LAYOUT_STEREO;
 static const int dst_sample_rate = 32000;
 
-static int open_decoder(AVCodecContext* codec_ctx)
+static int open_decoder(AVCodecContext **codec_ctx, AVStream* stream)
 {
-  AVCodec* decoder = avcodec_find_decoder(codec_ctx->codec_id);
+  const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
   if(decoder == NULL)
   {
     return -1;
   }
 
-  if(avcodec_open2(codec_ctx, decoder, NULL) < 0)
+  *codec_ctx = avcodec_alloc_context3(decoder);
+  if (!*codec_ctx)
   {
     return -2;
+  }
+
+  if(avcodec_parameters_to_context(*codec_ctx, stream->codecpar) < 0)
+  {
+    return -3;
+  }
+
+  if((*codec_ctx)->codec_type == AVMEDIA_TYPE_VIDEO)
+  {
+    (*codec_ctx)->framerate = av_guess_frame_rate(inputFile.fmt_ctx, stream, NULL);
+  }
+
+  if(avcodec_open2(*codec_ctx, decoder, NULL) < 0)
+  {
+    return -4;
   }
 
   return 0;
@@ -53,8 +70,8 @@ static int open_decoder(AVCodecContext* codec_ctx)
 static int open_input(const char* filename)
 {
   unsigned int index;
-
   inputFile.fmt_ctx = NULL;
+  inputFile.a_codec_ctx = inputFile.v_codec_ctx = NULL;
   inputFile.a_index = inputFile.v_index = -1;
 
   if(avformat_open_input(&inputFile.fmt_ctx, filename, NULL, NULL) < 0)
@@ -71,19 +88,19 @@ static int open_input(const char* filename)
 
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-    if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
+    AVStream* stream = inputFile.fmt_ctx->streams[index];
+    if(stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.v_codec_ctx, stream) < 0)
       {
         break;
       }
 
       inputFile.v_index = index;
     }
-    else if(codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
+    else if(stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.a_codec_ctx, stream) < 0)
       {
         break;
       }
@@ -107,6 +124,7 @@ static int create_output(const char* filename)
   int out_index;
 
   outputFile.fmt_ctx = NULL;
+  outputFile.a_codec_ctx = outputFile.v_codec_ctx = NULL;
   outputFile.a_index = outputFile.v_index = -1;
 
   if(avformat_alloc_output_context2(&outputFile.fmt_ctx, NULL, NULL, filename) < 0)
@@ -118,29 +136,44 @@ static int create_output(const char* filename)
   out_index = 0;
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    if(index != inputFile.v_index && index != inputFile.a_index)
+    AVStream* stream;
+    AVCodecContext* in_codec_ctx;
+    AVCodecContext* out_codec_ctx;
+    enum AVCodecID codec_id;
+    const AVCodec* encoder;
+
+    if(index == inputFile.v_index)
+    {
+      in_codec_ctx = inputFile.v_codec_ctx;
+      codec_id = AV_CODEC_ID_H264;
+    }
+    else if(index == inputFile.a_index)
+    {
+      in_codec_ctx = inputFile.a_codec_ctx;
+      codec_id = AV_CODEC_ID_AAC;
+    }
+    else
     {
       continue;
     }
 
-    AVStream* stream;
-    AVCodecContext* in_codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-    AVCodecContext* out_codec_ctx;
-    AVCodec* encoder;
-    
-    encoder = avcodec_find_encoder((index == inputFile.v_index) ? AV_CODEC_ID_H264 : AV_CODEC_ID_AAC);
-    if(encoder == NULL)
-    {
-      break;
-    }
-
-    stream = avformat_new_stream(outputFile.fmt_ctx, encoder);
+    stream = avformat_new_stream(outputFile.fmt_ctx, NULL);
     if(stream == NULL)
     {
       break;
     }
 
-    out_codec_ctx = stream->codec;
+    encoder = avcodec_find_encoder(codec_id);
+    if(encoder == NULL)
+    {
+      break;
+    }
+
+    out_codec_ctx = avcodec_alloc_context3(encoder);
+    if(out_codec_ctx == NULL)
+    {
+      break;
+    }
 
     if(index == inputFile.v_index)
     {
@@ -151,6 +184,7 @@ static int create_output(const char* filename)
       out_codec_ctx->sample_aspect_ratio = in_codec_ctx->sample_aspect_ratio;
       out_codec_ctx->pix_fmt = avcodec_default_get_format(out_codec_ctx, encoder->pix_fmts);
 
+      outputFile.v_codec_ctx = out_codec_ctx;
       outputFile.v_index = out_index++;
     }
     else if(index == inputFile.a_index)
@@ -162,18 +196,28 @@ static int create_output(const char* filename)
       out_codec_ctx->sample_fmt = encoder->sample_fmts[0];
       out_codec_ctx->time_base = (AVRational){1, dst_sample_rate};
 
+      outputFile.a_codec_ctx = out_codec_ctx;
       outputFile.a_index = out_index++;
     }
 
     if(outputFile.fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
     {
-      out_codec_ctx->flags |= CODEC_FLAG_GLOBAL_HEADER;
+      out_codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    if(avcodec_open2(out_codec_ctx, encoder, NULL) < 0) 
+    if(avcodec_open2(out_codec_ctx, encoder, NULL) < 0)
     {
+      printf("Failed to open encoder\n");
       return -2;
     }
+
+    if(avcodec_parameters_from_context(stream->codecpar, out_codec_ctx) < 0)
+    {
+      printf("Failed to copy encoder parameters to output stream\n");
+      return -3;
+    }
+
+    stream->time_base = out_codec_ctx->time_base;
   } // for
 
   if(!(outputFile.fmt_ctx->oformat->flags & AVFMT_NOFILE))
@@ -198,8 +242,8 @@ static int init_video_filter()
 {
   AVStream* in_stream = inputFile.fmt_ctx->streams[inputFile.v_index];
   AVStream* out_stream = outputFile.fmt_ctx->streams[outputFile.v_index];
-  AVCodecContext* in_codec_ctx = in_stream->codec;
-  AVCodecContext* out_codec_ctx = in_stream->codec;
+  AVCodecContext* in_codec_ctx = inputFile.v_codec_ctx;
+  AVCodecContext* out_codec_ctx = outputFile.v_codec_ctx;;
   AVFilterContext* rescale_filter;  
   AVFilterContext* format_filter;
 
@@ -307,7 +351,8 @@ static int init_video_filter()
 static int init_audio_filter()
 {
   AVStream* in_stream = inputFile.fmt_ctx->streams[inputFile.a_index];
-  AVCodecContext* in_codec_ctx = in_stream->codec;
+  AVCodecContext* in_codec_ctx = inputFile.a_codec_ctx;
+  AVCodecContext* out_codec_ctx = outputFile.a_codec_ctx;
   AVFilterInOut *inputs, *outputs;
   AVFilterContext* resample_filter;
   char args[512];
@@ -361,7 +406,7 @@ static int init_audio_filter()
   }
 
   snprintf(args, sizeof(args), "sample_fmts=%s:sample_rates=%d:channel_layouts=0x%"PRIx64
-    , av_get_sample_fmt_name(outputFile.fmt_ctx->streams[outputFile.a_index]->codec->sample_fmt)
+    , av_get_sample_fmt_name(out_codec_ctx->sample_fmt)
     , dst_sample_rate
     , dst_ch_layout);
 
@@ -400,29 +445,33 @@ static int init_audio_filter()
 
 static void release()
 {
-  unsigned int index;
+  if(inputFile.v_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.v_codec_ctx);
+  }
+
+  if(inputFile.a_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.a_codec_ctx);
+  }
+
   if(inputFile.fmt_ctx != NULL)
   {
-    for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
-    {
-      AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-      if(index == inputFile.v_index || index == inputFile.a_index)
-      {
-        avcodec_close(codec_ctx);
-      }
-    }
-
     avformat_close_input(&inputFile.fmt_ctx);
+  }
+
+  if(outputFile.v_codec_ctx != NULL)
+  {
+    avcodec_close(outputFile.v_codec_ctx);
+  }
+
+  if(outputFile.a_codec_ctx != NULL)
+  {
+    avcodec_close(outputFile.a_codec_ctx);
   }
 
   if(outputFile.fmt_ctx != NULL)
   {
-    for(index = 0; index < outputFile.fmt_ctx->nb_streams; index++)
-    {
-      AVCodecContext* codec_ctx = outputFile.fmt_ctx->streams[index]->codec;
-      avcodec_close(codec_ctx);
-    }
-
     if(!(outputFile.fmt_ctx->oformat->flags & AVFMT_NOFILE))
     {
       avio_closep(&outputFile.fmt_ctx->pb);
@@ -441,44 +490,59 @@ static void release()
   }
 }
 
-static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame** frame, int* got_frame)
+static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame)
 {
-  int (*decode_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
-  int decoded_size;
+  int ret;
 
-  decode_func = (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 : avcodec_decode_audio4;
-  decoded_size = decode_func(codec_ctx, *frame, got_frame, pkt);
-  if(*got_frame)
+  if(avcodec_send_packet(codec_ctx, pkt) < 0)
   {
-    (*frame)->pts = av_frame_get_best_effort_timestamp(*frame);
+    return -1;
   }
 
-  return decoded_size;
+  ret = avcodec_receive_frame(codec_ctx, frame);
+  if(ret < 0)
+  {
+    return ret;
+  }
+
+  return 0;
 }
 
-static int encode_write_frame(AVFrame* frame, int out_stream_index, int* got_packet)
+static int encode_frame(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket *pkt)
+{
+  int ret;
+
+  if(avcodec_send_frame(codec_ctx, frame) < 0)
+  {
+    return -1;
+  }
+
+  ret = avcodec_receive_packet(codec_ctx, pkt);
+  if(ret < 0)
+  {
+    return ret;
+  }
+
+  return 0;
+}
+
+
+static int encode_write_frame(AVFrame* frame, int out_stream_index)
 {
   AVStream* stream = outputFile.fmt_ctx->streams[out_stream_index];
-  AVCodecContext* codec_ctx = stream->codec;
-  int (*encode_func)(AVCodecContext*, AVPacket*, const AVFrame*, int *);
+  AVCodecContext* codec_ctx = (out_stream_index == outputFile.v_index) ?
+                    outputFile.v_codec_ctx : outputFile.a_codec_ctx;
   AVPacket encoded_pkt;
+  int ret;
   
   av_init_packet(&encoded_pkt);
   encoded_pkt.data = NULL;
   encoded_pkt.size = 0;
-  
-  encode_func = (out_stream_index == outputFile.v_index) ? avcodec_encode_video2 : avcodec_encode_audio2;
-  *got_packet = 0;
 
   if(frame != NULL) frame->pict_type = AV_PICTURE_TYPE_NONE;
 
-  if(encode_func(codec_ctx, &encoded_pkt, frame, got_packet) < 0)
-  {
-    printf("Error occurred when encoding frame\n");
-    return -1;
-  }
-
-  if(*got_packet)
+  ret = encode_frame(codec_ctx, frame, &encoded_pkt);
+  if(ret >= 0)
   {
     encoded_pkt.stream_index = out_stream_index;
     av_packet_rescale_ts(&encoded_pkt, codec_ctx->time_base, stream->time_base);
@@ -489,7 +553,7 @@ static int encode_write_frame(AVFrame* frame, int out_stream_index, int* got_pac
       return -2;
     }
 
-    av_free_packet(&encoded_pkt);
+    av_packet_unref(&encoded_pkt);
   }
 
   return 0;
@@ -498,10 +562,10 @@ static int encode_write_frame(AVFrame* frame, int out_stream_index, int* got_pac
 static int filter_encode_write_frame(AVFrame* frame, int out_stream_index)
 {
   AVStream* out_stream = outputFile.fmt_ctx->streams[out_stream_index];
-  AVCodecContext* out_codec_ctx = out_stream->codec;
+  AVCodecContext* out_codec_ctx = (out_stream_index == outputFile.v_index) ?
+                    outputFile.v_codec_ctx : outputFile.a_codec_ctx;
   FilterContext* filterContext = (out_stream_index == outputFile.v_index) ? 
                     &vfilter_ctx : &afilter_ctx;
-  int got_packet;
 
   AVFrame* filtered_frame = av_frame_alloc();
   if(filtered_frame == NULL)
@@ -522,7 +586,7 @@ static int filter_encode_write_frame(AVFrame* frame, int out_stream_index)
       break;
     }
 
-    if(encode_write_frame(filtered_frame, out_stream_index, &got_packet) < 0)
+    if(encode_write_frame(filtered_frame, out_stream_index) < 0)
     {
       break;
     }
@@ -538,8 +602,6 @@ int main(int argc, char* argv[])
 {
   int ret;
 
-  av_register_all();
-  avfilter_register_all();
   av_log_set_level(AV_LOG_DEBUG);
 
   if(argc < 3)
@@ -565,7 +627,6 @@ int main(int argc, char* argv[])
   }
   
   AVPacket pkt;
-  int got_frame;
   int out_stream_index;
 
   while(1)
@@ -580,39 +641,40 @@ int main(int argc, char* argv[])
     if(pkt.stream_index != inputFile.v_index && 
       pkt.stream_index != inputFile.a_index)
     {
-      av_free_packet(&pkt);
+      av_packet_unref(&pkt);
       continue;
     }
 
     AVStream* in_stream = inputFile.fmt_ctx->streams[pkt.stream_index];
-    AVCodecContext* in_codec_ctx = in_stream->codec;
+    AVCodecContext* in_codec_ctx = (pkt.stream_index == inputFile.v_index) ?
+                    inputFile.v_codec_ctx : inputFile.a_codec_ctx;
 
     out_stream_index = (pkt.stream_index == inputFile.v_index) ? 
             outputFile.v_index : outputFile.a_index;
 
-    got_frame = 0;    
     av_packet_rescale_ts(&pkt, in_stream->time_base, in_codec_ctx->time_base);
     
-    ret = decode_packet(in_codec_ctx, &pkt, &decoded_frame, &got_frame);
-    if(ret >= 0 && got_frame)
+    ret = decode_packet(in_codec_ctx, &pkt, decoded_frame);
+    if(ret >= 0)
     {
       ret = filter_encode_write_frame(decoded_frame, out_stream_index);
       av_frame_unref(decoded_frame);
       if(ret < 0)
       {
-        av_free_packet(&pkt);
+        printf("c\n");
+        av_packet_unref(&pkt);
         break;
       }
     } // if
 
-    av_free_packet(&pkt);
+    av_packet_unref(&pkt);
   } // while
 
   // Flush all remaining frames in encoder and filter.
-  int index, got_packet;
+  int index;
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    if(pkt.stream_index != inputFile.v_index && 
+    if(pkt.stream_index != inputFile.v_index &&
       pkt.stream_index != inputFile.a_index)
     {
       continue;
@@ -629,13 +691,11 @@ int main(int argc, char* argv[])
     }
 
     // flush encoder
-    while(1)
+    ret = encode_write_frame(NULL, out_stream_index);
+    if(ret < 0)
     {
-      ret = encode_write_frame(NULL, out_stream_index, &got_packet);
-      if(ret < 0 || got_packet == 0)
-      {
-        break;
-      }
+      printf("Error occurred while flusing codec context\n");
+      break;
     }
   }
   

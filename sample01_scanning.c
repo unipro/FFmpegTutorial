@@ -8,8 +8,6 @@ int main(int argc, char* argv[])
 {
   unsigned int index;
 
-  av_register_all();
-
   // Print debug log in library level.
   av_log_set_level(AV_LOG_DEBUG);
 
@@ -19,7 +17,7 @@ int main(int argc, char* argv[])
     return 0;
   }
 
-  // Get fmt_ctx from given file path. 
+  // Get fmt_ctx from given file path.
   if(avformat_open_input(&fmt_ctx, argv[1], NULL, NULL) < 0)
   {
     printf("Could not open input file %s\n", argv[1]);
@@ -36,21 +34,21 @@ int main(int argc, char* argv[])
   // fmt_ctx->nb_streams : number of total streams in video file.
   for(index = 0; index < fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* avCodecContext = fmt_ctx->streams[index]->codec;
-    if(avCodecContext->codec_type == AVMEDIA_TYPE_VIDEO)
+    AVCodecParameters* avCodecParams = fmt_ctx->streams[index]->codecpar;
+    if(avCodecParams->codec_type == AVMEDIA_TYPE_VIDEO)
     {
       printf("------- Video info -------\n");
-      printf("codec_id : %d\n", avCodecContext->codec_id);
-      printf("bitrate : %d\n", avCodecContext->bit_rate);
-      printf("width : %d / height : %d\n", avCodecContext->width, avCodecContext->height);
+      printf("codec_id : %d\n", avCodecParams->codec_id);
+      printf("bitrate : %" PRId64 "\n", avCodecParams->bit_rate);
+      printf("width : %d / height : %d\n", avCodecParams->width, avCodecParams->height);
     }
-    else if(avCodecContext->codec_type == AVMEDIA_TYPE_AUDIO)
+    else if(avCodecParams->codec_type == AVMEDIA_TYPE_AUDIO)
     {
       printf("------- Audio info -------\n");
-      printf("codec_id : %d\n", avCodecContext->codec_id);
-      printf("bitrate : %d\n", avCodecContext->bit_rate);
-      printf("sample_rate : %d\n", avCodecContext->sample_rate);
-      printf("number of channels : %d\n", avCodecContext->channels);
+      printf("codec_id : %d\n", avCodecParams->codec_id);
+      printf("bitrate : %" PRId64 "\n", avCodecParams->bit_rate);
+      printf("sample_rate : %d\n", avCodecParams->sample_rate);
+      printf("number of channels : %d\n", avCodecParams->channels);
     }
   } // for
 

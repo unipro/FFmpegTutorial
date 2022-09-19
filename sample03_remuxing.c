@@ -32,12 +32,12 @@ static int open_input(const char* fileName)
 
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-    if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
+    AVCodecParameters* avCodecParams = inputFile.fmt_ctx->streams[index]->codecpar;
+    if(avCodecParams->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
     {
       inputFile.v_index = index;
     }
-    else if(codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
+    else if(avCodecParams->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
     {
       inputFile.a_index = index;
     }
@@ -78,30 +78,23 @@ static int create_output(const char* fileName)
     }
 
     AVStream* in_stream = inputFile.fmt_ctx->streams[index];
-    AVCodecContext* in_codec_ctx = in_stream->codec;
+    AVCodecParameters *in_codecpar = in_stream->codecpar;
 
-    AVStream* out_stream = avformat_new_stream(outputFile.fmt_ctx, in_codec_ctx->codec);
+    AVStream* out_stream = avformat_new_stream(outputFile.fmt_ctx, NULL);
     if(out_stream == NULL)
     {
       printf("Failed to allocate output stream\n");
       return -2;
     }
 
-    AVCodecContext* outCodecContext = out_stream->codec;
-    if(avcodec_copy_context(outCodecContext, in_codec_ctx) < 0)
+    if(avcodec_parameters_copy(out_stream->codecpar, in_codecpar) < 0)
     {
       printf("Error occurred while copying context\n");
       return -3;
     }
 
-    // Use AVStream instead of AVCodecContext(Deprecated).
-    out_stream->time_base = in_stream->time_base;
     // Remove codec tag info for compatibility with ffmpeg.
-    outCodecContext->codec_tag = 0;
-    if(outputFile.fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER)
-    {
-      outCodecContext->flags |= CODEC_FLAG_GLOBAL_HEADER;
-    }
+    out_stream->codecpar->codec_tag = 0;
 
     if(index == inputFile.v_index)
     {
@@ -154,7 +147,6 @@ int main(int argc, char* argv[])
 {
   int ret;
 
-  av_register_all();
   av_log_set_level(AV_LOG_DEBUG);
 
   if(argc < 3)
@@ -174,7 +166,7 @@ int main(int argc, char* argv[])
   }
 
   // dump output container, which i just make from above.
-  av_dump_format(outputFile.fmt_ctx, 0, outputFile.fmt_ctx->filename, 1);
+  av_dump_format(outputFile.fmt_ctx, 0, outputFile.fmt_ctx->url, 1);
 
   AVPacket pkt;
   int out_stream_index;
@@ -191,7 +183,7 @@ int main(int argc, char* argv[])
     if(pkt.stream_index != inputFile.v_index && 
       pkt.stream_index != inputFile.a_index)
     {
-      av_free_packet(&pkt);
+      av_packet_unref(&pkt);
       continue;
     }
 

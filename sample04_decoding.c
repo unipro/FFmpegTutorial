@@ -7,25 +7,45 @@
 typedef struct _FileContext
 {
   AVFormatContext* fmt_ctx;
+  AVCodecContext *v_codec_ctx;
+  AVCodecContext *a_codec_ctx;
   int v_index;
   int a_index;
 } FileContext;
 
 static FileContext inputFile;
 
-static int open_decoder(AVCodecContext* codec_ctx)
+static int open_decoder(AVCodecContext **codec_ctx, AVStream* stream)
 {
   // Find a decoder by codec ID
-  AVCodec* decoder = avcodec_find_decoder(codec_ctx->codec_id);
+  const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
   if(decoder == NULL)
   {
     return -1;
   }
 
-  // Open the codec using decoder
-  if(avcodec_open2(codec_ctx, decoder, NULL) < 0)
+  // Allocate a codec context for the decoder
+  *codec_ctx = avcodec_alloc_context3(decoder);
+  if (!*codec_ctx)
   {
     return -2;
+  }
+
+  // Copy codec parameters from input stream to output codec context
+  if(avcodec_parameters_to_context(*codec_ctx, stream->codecpar) < 0)
+  {
+    return -3;
+  }
+
+  if((*codec_ctx)->codec_type == AVMEDIA_TYPE_VIDEO)
+  {
+    (*codec_ctx)->framerate = av_guess_frame_rate(inputFile.fmt_ctx, stream, NULL);
+  }
+
+  // Open the codec using decoder
+  if(avcodec_open2(*codec_ctx, decoder, NULL) < 0)
+  {
+    return -4;
   }
 
   return 0;
@@ -34,8 +54,8 @@ static int open_decoder(AVCodecContext* codec_ctx)
 static int open_input(const char* filename)
 {
   unsigned int index;
-
   inputFile.fmt_ctx = NULL;
+  inputFile.a_codec_ctx = inputFile.v_codec_ctx = NULL;
   inputFile.a_index = inputFile.v_index = -1;
 
   if(avformat_open_input(&inputFile.fmt_ctx, filename, NULL, NULL) < 0)
@@ -52,19 +72,19 @@ static int open_input(const char* filename)
 
   for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
   {
-    AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-    if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
+    AVStream* stream = inputFile.fmt_ctx->streams[index];
+    if(stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && inputFile.v_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.v_codec_ctx, stream) < 0)
       {
         break;
       }
 
       inputFile.v_index = index;
     }
-    else if(codec_ctx->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
+    else if(stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && inputFile.a_index < 0)
     {
-      if(open_decoder(codec_ctx) < 0)
+      if(open_decoder(&inputFile.a_codec_ctx, stream) < 0)
       {
         break;
       }
@@ -84,44 +104,46 @@ static int open_input(const char* filename)
 
 static void release()
 {
+  if(inputFile.v_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.v_codec_ctx);
+  }
+
+  if(inputFile.a_codec_ctx != NULL)
+  {
+    avcodec_close(inputFile.a_codec_ctx);
+  }
+
   if(inputFile.fmt_ctx != NULL)
   {
-    unsigned int index;
-    for(index = 0; index < inputFile.fmt_ctx->nb_streams; index++)
-    {
-      AVCodecContext* codec_ctx = inputFile.fmt_ctx->streams[index]->codec;
-      if(index == inputFile.v_index || index == inputFile.a_index)
-      {
-        avcodec_close(codec_ctx);
-      }
-    }
-
     avformat_close_input(&inputFile.fmt_ctx);
   }
 }
 
-static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame** frame, int* got_frame)
+static int decode_packet(AVCodecContext* codec_ctx, AVPacket* pkt, AVFrame* frame)
 {
-  int (*decode_func)(AVCodecContext *, AVFrame *, int *, const AVPacket *);
-  int decoded_size;
+  int ret;
 
-  // Decide which is needed for decoding pakcet. 
-  decode_func = (codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO) ? avcodec_decode_video2 : avcodec_decode_audio4;
-  decoded_size = decode_func(codec_ctx, *frame, got_frame, pkt);
-  if(*got_frame)
+  // submit the packet to the decoder
+  if(avcodec_send_packet(codec_ctx, pkt) < 0)
   {
-    // This adjust PTS/DTS automatically in frame.
-    (*frame)->pts = av_frame_get_best_effort_timestamp(*frame);
+    return -1;
   }
 
-  return decoded_size;
+  // Get all the available frames from the decoder
+  ret = avcodec_receive_frame(codec_ctx, frame);
+  if(ret < 0)
+  {
+    return ret;
+  }
+
+  return 0;
 }
 
 int main(int argc, char* argv[])
 {
   int ret;
 
-  av_register_all();
   av_log_set_level(AV_LOG_DEBUG);
 
   if(argc < 2)
@@ -140,8 +162,7 @@ int main(int argc, char* argv[])
   if(decoded_frame == NULL) goto main_end;
   
   AVPacket pkt;
-  int got_frame;
-  
+
   while(1)
   {
     ret = av_read_frame(inputFile.fmt_ctx, &pkt);
@@ -151,43 +172,45 @@ int main(int argc, char* argv[])
       break;
     }
 
-    if(pkt.stream_index != inputFile.v_index && 
-      pkt.stream_index != inputFile.a_index)
+    if(pkt.stream_index == inputFile.v_index)
     {
-      av_free_packet(&pkt);
-      continue;
+      ret = decode_packet(inputFile.v_codec_ctx, &pkt, decoded_frame);
+      if (ret >= 0)
+      {
+        printf("-----------------------\n");
+        printf("Video : frame->width, height : %dx%d\n",
+          decoded_frame->width, decoded_frame->height);
+        printf("Video : frame->sample_aspect_ratio : %d/%d\n",
+          decoded_frame->sample_aspect_ratio.num, decoded_frame->sample_aspect_ratio.den);
+        av_frame_unref(decoded_frame);
+      }
+    }
+    else if(pkt.stream_index == inputFile.a_index)
+    {
+      ret = decode_packet(inputFile.a_codec_ctx, &pkt, decoded_frame);
+      if (ret >= 0)
+      {
+        printf("-----------------------\n");
+        printf("Audio : frame->nb_samples : %d\n",
+          decoded_frame->nb_samples);
+        printf("Audio : frame->channels : %d\n",
+          decoded_frame->channels);
+        av_frame_unref(decoded_frame);
+      }
     }
 
-    AVStream* avStream = inputFile.fmt_ctx->streams[pkt.stream_index];
-    AVCodecContext* codec_ctx = avStream->codec;
-    got_frame = 0;
-
-    av_packet_rescale_ts(&pkt, avStream->time_base, codec_ctx->time_base);
-
-    ret = decode_packet(codec_ctx, &pkt, &decoded_frame, &got_frame);
-    if(ret >= 0 && got_frame)
-    {
-      printf("-----------------------\n");
-      if(codec_ctx->codec_type == AVMEDIA_TYPE_VIDEO)
-      {
-        printf("Video : frame->width, height : %dx%d\n", 
-          decoded_frame->width, decoded_frame->height);
-        printf("Video : frame->sample_aspect_ratio : %d/%d\n", 
-          decoded_frame->sample_aspect_ratio.num, decoded_frame->sample_aspect_ratio.den);
-      }
-      else
-      {
-        printf("Audio : frame->nb_samples : %d\n", 
-          decoded_frame->nb_samples);
-        printf("Audio : frame->channels : %d\n", 
-          decoded_frame->channels);
-      }
-
-      av_frame_unref(decoded_frame);
-    } // if
-
-    av_free_packet(&pkt);
+    av_packet_unref(&pkt);
   } // while
+
+  // flush the decoder
+  if(inputFile.v_codec_ctx != NULL)
+  {
+    decode_packet(inputFile.v_codec_ctx, NULL, decoded_frame);
+  }
+  if(inputFile.a_codec_ctx != NULL)
+  {
+    decode_packet(inputFile.a_codec_ctx, NULL, decoded_frame);
+  }
 
   av_frame_free(&decoded_frame);
 
